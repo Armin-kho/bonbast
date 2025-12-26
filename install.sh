@@ -1,78 +1,87 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ====== CONFIG (edit these in GitHub if you fork) ======
+REPO_SLUG="Armin-kho/bonbast"
+BRANCH="main"
+# =======================================================
+
 echo "== Bonbast Telegram Bot installer =="
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-if ! need_cmd python3; then
-  echo "python3 not found."
-  if need_cmd apt-get; then
-    echo "Installing python3 + venv via apt..."
-    sudo apt-get update
-    sudo apt-get install -y python3 python3-venv python3-pip
-  else
-    echo "Please install python3 and python3-venv and re-run."
-    exit 1
-  fi
-fi
+apt_install() {
+  sudo apt-get update
+  # Install each package separately so a missing one doesn't kill the whole install
+  for p in "$@"; do
+    sudo apt-get install -y "$p" || true
+  done
+}
 
-if ! need_cmd unzip; then
+if ! need_cmd python3; then
   if need_cmd apt-get; then
-    sudo apt-get update
-    sudo apt-get install -y unzip
+    apt_install python3 python3-pip
   else
-    echo "Please install unzip."
+    echo "python3 not found and no apt-get available. Install Python 3 manually."
     exit 1
   fi
 fi
 
 if ! need_cmd curl; then
   if need_cmd apt-get; then
-    sudo apt-get update
-    sudo apt-get install -y curl
+    apt_install curl
   else
-    echo "Please install curl."
+    echo "curl not found. Install curl manually."
     exit 1
   fi
 fi
 
+# Ensure venv/ensurepip exists (Ubuntu/Debian split python into packages)
+PYVER="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
+  if need_cmd apt-get; then
+    apt_install python3-venv "python${PYVER}-venv" python3-pip
+  fi
+fi
+
+# Final venv sanity check
+TMPV="$(mktemp -d)"
+if ! python3 -m venv "$TMPV/.venv" >/dev/null 2>&1; then
+  echo "ERROR: python venv still failing (ensurepip missing)."
+  echo "Try: sudo apt install -y python3-venv python${PYVER}-venv python3-pip"
+  rm -rf "$TMPV"
+  exit 1
+fi
+rm -rf "$TMPV"
+
 read -r -p "Install directory [$HOME/bonbast-bot]: " INSTALL_DIR
 INSTALL_DIR="${INSTALL_DIR:-$HOME/bonbast-bot}"
 
-read -r -p "GitHub repo zip URL (example: https://github.com/USER/REPO/archive/refs/heads/main.zip): " ZIP_URL
-if [[ -z "$ZIP_URL" ]]; then
-  echo "ZIP URL is required."
-  exit 1
-fi
+APP_DIR="$INSTALL_DIR/app"
+mkdir -p "$APP_DIR"
 
-mkdir -p "$INSTALL_DIR"
-tmpzip="$(mktemp).zip"
-echo "Downloading repo zip..."
-curl -L "$ZIP_URL" -o "$tmpzip"
+RAW_BASE="https://raw.githubusercontent.com/${REPO_SLUG}/${BRANCH}"
 
-tmpdir="$(mktemp -d)"
-unzip -q "$tmpzip" -d "$tmpdir"
-rm -f "$tmpzip"
+echo "Downloading app files from ${REPO_SLUG}@${BRANCH} ..."
+download() {
+  local file="$1"
+  curl -fsSL "${RAW_BASE}/${file}" -o "${APP_DIR}/${file}"
+}
 
-# The zip extracts into a single folder
-SRC_DIR="$(find "$tmpdir" -maxdepth 1 -type d -name "*-main" -o -name "*-master" | head -n 1)"
-if [[ -z "$SRC_DIR" ]]; then
-  SRC_DIR="$(find "$tmpdir" -maxdepth 2 -type d | head -n 1)"
-fi
+download requirements.txt
+download bonbast_client.py
+download models.py
+download storage.py
+download main.py
+download README.md || true
 
-echo "Copying files..."
-rm -rf "$INSTALL_DIR/app"
-mkdir -p "$INSTALL_DIR/app"
-cp -r "$SRC_DIR"/* "$INSTALL_DIR/app/"
-
-cd "$INSTALL_DIR/app"
+cd "$APP_DIR"
 
 echo "Creating venv..."
 python3 -m venv .venv
 # shellcheck disable=SC1091
 source .venv/bin/activate
-pip install --upgrade pip
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 
 read -r -p "Telegram BOT_TOKEN: " BOT_TOKEN
@@ -99,9 +108,9 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=$INSTALL_DIR/app
-EnvironmentFile=$INSTALL_DIR/app/.env
-ExecStart=$INSTALL_DIR/app/.venv/bin/python $INSTALL_DIR/app/main.py
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$APP_DIR/.env
+ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/main.py
 Restart=always
 RestartSec=3
 
@@ -116,7 +125,7 @@ EOF"
   echo "Logs: sudo journalctl -u $SERVICE_NAME -f"
 else
   echo "Run manually:"
-  echo "  cd $INSTALL_DIR/app"
+  echo "  cd $APP_DIR"
   echo "  source .venv/bin/activate"
   echo "  export \$(cat .env | xargs) && python main.py"
 fi
