@@ -6,95 +6,85 @@ REPO_NAME="bonbast"
 REPO_BRANCH="main"
 RAW_BASE="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REPO_BRANCH}"
 
-APP_DIR_DEFAULT="/root/bonbast-bot"
-SERVICE_NAME="bonbast-bot"
-APP_SUBDIR="app"
+echo "== Bonbast Telegram Bot installer/updater =="
 
-need_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    echo "Run as root (sudo -i)."
-    exit 1
-  fi
-}
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "Run as root (sudo su -)"
+  exit 1
+fi
 
-apt_install() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y python3 python3-venv python3-pip curl ca-certificates
-}
+read -r -p "Install directory [/root/bonbast-bot]: " INSTALL_DIR
+INSTALL_DIR="${INSTALL_DIR:-/root/bonbast-bot}"
+APP_DIR="${INSTALL_DIR}/app"
+ENV_FILE="${APP_DIR}/.env"
+DB_DIR="${APP_DIR}/data"
+DB_PATH_DEFAULT="${DB_DIR}/bonbast.db"
 
-download_file() {
-  local url="$1"
-  local out="$2"
-  curl -fsSL "$url" -o "$out"
-}
+apt-get update -y
+apt-get install -y python3 python3-venv python3-pip wget curl
 
-prompt() {
-  local var="$1"
-  local text="$2"
-  local def="${3:-}"
-  local val=""
-  read -r -p "${text}${def:+ [${def}]}: " val
-  if [[ -z "$val" ]]; then
-    val="$def"
-  fi
-  printf -v "$var" '%s' "$val"
-}
+mkdir -p "$APP_DIR" "$DB_DIR"
 
-main() {
-  need_root
-  echo "== Bonbast Telegram Bot installer/updater =="
+echo "Downloading app files from ${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH} ..."
+cd "$APP_DIR"
+wget -q "${RAW_BASE}/requirements.txt" -O requirements.txt
+wget -q "${RAW_BASE}/storage.py" -O storage.py
+wget -q "${RAW_BASE}/bonbast_client.py" -O bonbast_client.py
+wget -q "${RAW_BASE}/main.py" -O main.py
 
-  local install_dir=""
-  prompt install_dir "Install directory" "$APP_DIR_DEFAULT"
+if [[ ! -d ".venv" ]]; then
+  python3 -m venv .venv
+fi
 
-  mkdir -p "${install_dir}/${APP_SUBDIR}"
-  cd "${install_dir}/${APP_SUBDIR}"
+./.venv/bin/python -m pip install --upgrade pip
+./.venv/bin/pip install -r requirements.txt
 
-  echo "Installing OS deps..."
-  apt_install
+if [[ -f "$ENV_FILE" ]]; then
+  echo ".env already exists."
+else
+  touch "$ENV_FILE"
+fi
 
-  echo "Downloading app files from ${REPO_OWNER}/${REPO_NAME}@${REPO_BRANCH} ..."
-  download_file "${RAW_BASE}/requirements.txt" "requirements.txt"
-  download_file "${RAW_BASE}/main.py" "main.py"
-  download_file "${RAW_BASE}/storage.py" "storage.py"
-  download_file "${RAW_BASE}/bonbast_client.py" "bonbast_client.py"
+# Ensure required keys exist
+get_env() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -n1 | cut -d= -f2-; }
 
-  echo "Creating/Updating venv..."
-  if [[ ! -d ".venv" ]]; then
-    python3 -m venv .venv
-  fi
-  . ".venv/bin/activate"
-  python -m pip install -U pip
-  python -m pip install -r requirements.txt
+BOT_TOKEN="$(get_env BOT_TOKEN || true)"
+ADMIN_IDS="$(get_env ADMIN_IDS || true)"
+DB_PATH="$(get_env DB_PATH || true)"
+LOG_LEVEL="$(get_env LOG_LEVEL || true)"
 
-  # .env
-  local env_file="${install_dir}/${APP_SUBDIR}/.env"
-  if [[ -f "$env_file" ]]; then
-    read -r -p ".env already exists. Keep existing .env? [Y/n]: " keep
-    keep="${keep:-Y}"
-    if [[ "$keep" =~ ^[Nn]$ ]]; then
-      rm -f "$env_file"
-    fi
-  fi
+if [[ -z "${BOT_TOKEN}" ]]; then
+  read -r -p "BOT_TOKEN: " BOT_TOKEN
+fi
 
-  if [[ ! -f "$env_file" ]]; then
-    echo "Creating .env ..."
-    local bot_token=""
-    local admin_ids=""
-    prompt bot_token "BOT_TOKEN (from BotFather)" ""
-    prompt admin_ids "ADMIN_IDS (your numeric Telegram user id, comma-separated if multiple)" ""
-    cat > "$env_file" <<EOF
-BOT_TOKEN=${bot_token}
-ADMIN_IDS=${admin_ids}
-LOG_LEVEL=INFO
-# DB_PATH=${install_dir}/${APP_SUBDIR}/data.db
-EOF
-  fi
+if [[ -z "${ADMIN_IDS}" ]]; then
+  echo "ADMIN_IDS is required (your Telegram numeric user id)."
+  echo "You can get it by messaging @userinfobot in Telegram."
+  read -r -p "ADMIN_IDS (comma-separated): " ADMIN_IDS
+fi
 
-  # systemd unit
-  local unit="/etc/systemd/system/${SERVICE_NAME}.service"
-  cat > "$unit" <<EOF
+if [[ -z "${DB_PATH}" ]]; then
+  DB_PATH="$DB_PATH_DEFAULT"
+fi
+
+if [[ -z "${LOG_LEVEL}" ]]; then
+  LOG_LEVEL="INFO"
+fi
+
+# Rewrite .env with required keys (preserve other lines)
+tmp_env="$(mktemp)"
+grep -vE "^(BOT_TOKEN|ADMIN_IDS|DB_PATH|LOG_LEVEL)=" "$ENV_FILE" > "$tmp_env" || true
+{
+  echo "BOT_TOKEN=${BOT_TOKEN}"
+  echo "ADMIN_IDS=${ADMIN_IDS}"
+  echo "DB_PATH=${DB_PATH}"
+  echo "LOG_LEVEL=${LOG_LEVEL}"
+  cat "$tmp_env"
+} > "$ENV_FILE"
+rm -f "$tmp_env"
+
+SERVICE_FILE="/etc/systemd/system/bonbast-bot.service"
+cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Bonbast Telegram Bot
 After=network-online.target
@@ -102,23 +92,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${install_dir}/${APP_SUBDIR}
-EnvironmentFile=${install_dir}/${APP_SUBDIR}/.env
-ExecStart=${install_dir}/${APP_SUBDIR}/.venv/bin/python ${install_dir}/${APP_SUBDIR}/main.py
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${ENV_FILE}
+ExecStart=${APP_DIR}/.venv/bin/python ${APP_DIR}/main.py
 Restart=always
-RestartSec=2
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
-  systemctl restart "${SERVICE_NAME}"
+systemctl daemon-reload
+systemctl enable bonbast-bot.service
+systemctl restart bonbast-bot.service
 
-  echo "Done."
-  echo "Status: systemctl status ${SERVICE_NAME} --no-pager"
-  echo "Logs:   journalctl -u ${SERVICE_NAME} -f"
-}
-
-main "$@"
+echo "Done."
+echo "Status: systemctl status bonbast-bot --no-pager"
+echo "Logs:   journalctl -u bonbast-bot -f"
