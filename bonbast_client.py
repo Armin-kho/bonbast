@@ -1,78 +1,70 @@
 import re
-import httpx
+import time
 from typing import Any, Dict, Optional
+
+import httpx
 
 
 class BonbastClient:
     """
-    Fast + lightweight:
-    - fetch homepage
-    - extract /json param token from embedded JS
-    - POST /json to get values
+    Bonbast exposes data via POST /json with a changing 'param' value embedded in homepage HTML/JS.
+    We fetch the homepage, extract param, then fetch /json.
     """
 
-    HOME_URL = "https://bonbast.com/"
-    JSON_URL = "https://bonbast.com/json"
-
-    _param_re = re.compile(r"""\.post\('/json'\s*,\s*\{param:\s*"([^"]+)"\}""")
+    BASE_URL = "https://bonbast.com"
 
     def __init__(self) -> None:
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(8.0, connect=5.0),
+            base_url=self.BASE_URL,
+            timeout=httpx.Timeout(15.0, connect=10.0),
             headers={
-                "User-Agent": "bonbast-bot/1.0 (+https://bonbast.com/)",
-                "Accept": "text/html,application/json",
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) bonbast-bot/1.0",
+                "Accept": "*/*",
+                "Referer": self.BASE_URL + "/",
             },
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=10),
             follow_redirects=True,
         )
-        self._cached_param: Optional[str] = None
+        self._param: Optional[str] = None
+        self._param_ts: float = 0.0
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def _get_param(self) -> str:
-        # cache for speed; refresh if needed
-        if self._cached_param:
-            return self._cached_param
+    async def _get_param(self, force: bool = False) -> str:
+        # Cache param for a while; refresh on failure.
+        if not force and self._param and (time.time() - self._param_ts) < 3600:
+            return self._param
 
-        r = await self._client.get(self.HOME_URL)
+        r = await self._client.get("/")
         r.raise_for_status()
-        m = self._param_re.search(r.text)
+        html = r.text
+
+        # Typical patterns in the page:
+        # $.post('/json', {param:"...."}, ...
+        m = re.search(r"\.post\(\s*['\"]\/json['\"]\s*,\s*\{\s*param\s*:\s*['\"]([^'\"]+)['\"]", html)
         if not m:
-            raise RuntimeError("Could not extract /json param token from bonbast homepage.")
-        self._cached_param = m.group(1)
-        return self._cached_param
+            # Alternate pattern fallback
+            m = re.search(r"param\s*:\s*['\"]([^'\"]+)['\"]", html)
+        if not m:
+            raise RuntimeError("Could not extract bonbast param from homepage")
 
-    async def fetch_json(self) -> Dict[str, Any]:
-        # param can rotate; if POST fails, refresh token once
-        param = await self._get_param()
-        try:
-            r = await self._client.post(self.JSON_URL, data={"param": param})
-            r.raise_for_status()
-            return r.json()
-        except Exception:
-            self._cached_param = None
-            param = await self._get_param()
-            r = await self._client.post(self.JSON_URL, data={"param": param})
-            r.raise_for_status()
-            return r.json()
+        self._param = m.group(1)
+        self._param_ts = time.time()
+        return self._param
 
-    @staticmethod
-    def _as_float(v: Any) -> Optional[float]:
-        if v is None:
-            return None
-        if isinstance(v, (int, float)):
-            return float(v)
-        s = str(v).strip().replace(",", "")
-        if not s:
-            return None
-        try:
-            return float(s)
-        except Exception:
-            return None
+    async def fetch(self) -> Dict[str, Any]:
+        param = await self._get_param(force=False)
 
-    @staticmethod
-    def get_value_float(item: "Item", json_data: Dict[str, Any], mode: str) -> Optional[float]:
-        key = item.sell_key if mode == "sell" else item.buy_key
-        return BonbastClient._as_float(json_data.get(key))
+        # Bonbast expects form-encoded POST
+        r = await self._client.post("/json", data={"param": param})
+        if r.status_code >= 400:
+            # refresh param once and retry
+            param = await self._get_param(force=True)
+            r = await self._client.post("/json", data={"param": param})
+
+        r.raise_for_status()
+
+        data = r.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("Unexpected bonbast /json response")
+        return data
