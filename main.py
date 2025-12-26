@@ -4,15 +4,20 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, time as dtime
 from typing import Any, Dict, List, Optional, Tuple
 
-import pytz
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatType
+from zoneinfo import ZoneInfo
+
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
     CallbackQueryHandler,
     ChatMemberHandler,
     CommandHandler,
@@ -24,841 +29,950 @@ from telegram.ext import (
 from bonbast_client import BonbastClient
 from storage import Storage
 
-
-TEHRAN_TZ = pytz.timezone("Asia/Tehran")
-SEP = "_______________________"
-
-
-def parse_admin_ids(s: str) -> List[int]:
-    out: List[int] = []
-    for part in re.split(r"[,\s]+", (s or "").strip()):
-        if not part:
-            continue
-        try:
-            out.append(int(part))
-        except Exception:
-            pass
-    return sorted(set(out))
+TZ = ZoneInfo("Asia/Tehran")
+LOG = logging.getLogger("bonbast-bot")
 
 
-def is_admin(update: Update, admin_ids: List[int]) -> bool:
-    u = update.effective_user
-    return bool(u and u.id in admin_ids)
-
+# ---------------- Catalog ----------------
 
 @dataclass(frozen=True)
 class Item:
-    code: str               # e.g. USD
-    kind: str               # currency | coin | metal
-    fa: str                 # Persian label
-    emoji: str              # emoji
-    sell_key: str           # json key for sell
-    buy_key: str            # json key for buy
-    money_emoji: bool = False   # USD/EUR/GBP special money emoji
+    code: str
+    fa: str
+    emoji: str
+    sell_key: str
+    buy_key: Optional[str] = None
+    category: str = "cur"  # cur|coin|metal
 
 
-# ---- All items shown on bonbast main page ----
-ITEMS: Dict[str, Item] = {
-    # Currencies (Sell/Buy keys are ids from the page: usd1/usd2 etc)
-    "USD": Item("USD", "currency", "دلار آمریکا", "💵", "usd1", "usd2", money_emoji=True),
-    "EUR": Item("EUR", "currency", "یورو", "💶", "eur1", "eur2", money_emoji=True),
-    "GBP": Item("GBP", "currency", "پوند انگلیس", "💷", "gbp1", "gbp2", money_emoji=True),
+CURRENCIES: List[Item] = [
+    Item("usd", "دلار آمریکا", "💵", "usd1", "usd2", "cur"),
+    Item("eur", "یورو", "💶", "eur1", "eur2", "cur"),
+    Item("gbp", "پوند انگلیس", "💷", "gbp1", "gbp2", "cur"),
 
-    "CHF": Item("CHF", "currency", "فرانک سوئیس", "🇨🇭", "chf1", "chf2"),
-    "CAD": Item("CAD", "currency", "دلار کانادا", "🇨🇦", "cad1", "cad2"),
-    "AUD": Item("AUD", "currency", "دلار استرالیا", "🇦🇺", "aud1", "aud2"),
-    "SEK": Item("SEK", "currency", "کرون سوئد", "🇸🇪", "sek1", "sek2"),
-    "NOK": Item("NOK", "currency", "کرون نروژ", "🇳🇴", "nok1", "nok2"),
-    "RUB": Item("RUB", "currency", "روبل روسیه", "🇷🇺", "rub1", "rub2"),
-    "THB": Item("THB", "currency", "بات تایلند", "🇹🇭", "thb1", "thb2"),
-    "SGD": Item("SGD", "currency", "دلار سنگاپور", "🇸🇬", "sgd1", "sgd2"),
-    "HKD": Item("HKD", "currency", "دلار هنگ‌کنگ", "🇭🇰", "hkd1", "hkd2"),
-    "AZN": Item("AZN", "currency", "منات آذربایجان", "🇦🇿", "azn1", "azn2"),
-    "AMD": Item("AMD", "currency", "درام ارمنستان", "🇦🇲", "amd1", "amd2"),
-
-    "DKK": Item("DKK", "currency", "کرون دانمارک", "🇩🇰", "dkk1", "dkk2"),
-    "AED": Item("AED", "currency", "درهم امارات", "🇦🇪", "aed1", "aed2"),
-    "JPY": Item("JPY", "currency", "ین ژاپن", "🇯🇵", "jpy1", "jpy2"),
-    "TRY": Item("TRY", "currency", "لیر ترکیه", "🇹🇷", "try1", "try2"),
-    "CNY": Item("CNY", "currency", "یوان چین", "🇨🇳", "cny1", "cny2"),
-    "SAR": Item("SAR", "currency", "ریال عربستان", "🇸🇦", "sar1", "sar2"),
-    "INR": Item("INR", "currency", "روپیه هند", "🇮🇳", "inr1", "inr2"),
-    "MYR": Item("MYR", "currency", "رینگیت مالزی", "🇲🇾", "myr1", "myr2"),
-    "AFN": Item("AFN", "currency", "افغانی افغانستان", "🇦🇫", "afn1", "afn2"),
-    "KWD": Item("KWD", "currency", "دینار کویت", "🇰🇼", "kwd1", "kwd2"),
-    "IQD": Item("IQD", "currency", "دینار عراق", "🇮🇶", "iqd1", "iqd2"),
-    "BHD": Item("BHD", "currency", "دینار بحرین", "🇧🇭", "bhd1", "bhd2"),
-    "OMR": Item("OMR", "currency", "ریال عمان", "🇴🇲", "omr1", "omr2"),
-    "QAR": Item("QAR", "currency", "ریال قطر", "🇶🇦", "qar1", "qar2"),
-
-    # Coins (sell/buy ids)
-    "EMAMI": Item("EMAMI", "coin", "امامی", "🪙", "emami1", "emami12"),
-    "AZADI": Item("AZADI", "coin", "آزادی", "🪙", "azadi1", "azadi12"),
-    "NIM": Item("NIM", "coin", "نیم", "🪙", "azadi1_2", "azadi1_22"),
-    "ROB": Item("ROB", "coin", "ربع", "🪙", "azadi1_4", "azadi1_42"),
-    "GERAMI": Item("GERAMI", "coin", "گرمی", "🪙", "azadi1g", "azadi1g2"),
-
-    # Metals + BTC
-    "GOL_MITHQAL": Item("GOL_MITHQAL", "metal", "طلا مثقال", "⚜️", "mithqal", "mithqal"),
-    "GOL_GRAM": Item("GOL_GRAM", "metal", "طلا گرمی", "⚜️", "gol18", "gol18"),
-    "GOL_OUNCE": Item("GOL_OUNCE", "metal", "طلا اونس", "🌍", "ounce", "ounce"),
-    "BTC": Item("BTC", "metal", "بیت‌کوین", "₿", "bitcoin", "bitcoin"),
-}
-
-DEFAULT_CURRENCY_ORDER = [
-    "USD", "EUR", "GBP",
-    "CHF", "CAD", "CNY", "AED", "TRY",
-    "KWD", "BHD", "IQD", "RUB",
-    "AUD", "SEK", "NOK", "THB", "SGD", "HKD", "AZN", "AMD", "DKK",
-    "SAR", "INR", "MYR", "AFN", "OMR", "QAR", "JPY",
+    Item("chf", "فرانک سوئیس", "🇨🇭", "chf1", "chf2", "cur"),
+    Item("cad", "دلار کانادا", "🇨🇦", "cad1", "cad2", "cur"),
+    Item("aud", "دلار استرالیا", "🇦🇺", "aud1", "aud2", "cur"),
+    Item("sek", "کرون سوئد", "🇸🇪", "sek1", "sek2", "cur"),
+    Item("nok", "کرون نروژ", "🇳🇴", "nok1", "nok2", "cur"),
+    Item("rub", "روبل روسیه", "🇷🇺", "rub1", "rub2", "cur"),
+    Item("thb", "بات تایلند", "🇹🇭", "thb1", "thb2", "cur"),
+    Item("sgd", "دلار سنگاپور", "🇸🇬", "sgd1", "sgd2", "cur"),
+    Item("hkd", "دلار هنگ‌کنگ", "🇭🇰", "hkd1", "hkd2", "cur"),
+    Item("azn", "منات آذربایجان", "🇦🇿", "azn1", "azn2", "cur"),
+    Item("amd", "درام ارمنستان", "🇦🇲", "amd1", "amd2", "cur"),
+    Item("dkk", "کرون دانمارک", "🇩🇰", "dkk1", "dkk2", "cur"),
+    Item("aed", "درهم امارات", "🇦🇪", "aed1", "aed2", "cur"),
+    Item("jpy", "ین ژاپن", "🇯🇵", "jpy1", "jpy2", "cur"),
+    Item("try", "لیر ترکیه", "🇹🇷", "try1", "try2", "cur"),
+    Item("cny", "یوان چین", "🇨🇳", "cny1", "cny2", "cur"),
+    Item("sar", "ریال عربستان", "🇸🇦", "sar1", "sar2", "cur"),
+    Item("inr", "روپیه هند", "🇮🇳", "inr1", "inr2", "cur"),
+    Item("myr", "رینگیت مالزی", "🇲🇾", "myr1", "myr2", "cur"),
+    Item("afn", "افغانی افغانستان", "🇦🇫", "afn1", "afn2", "cur"),
+    Item("kwd", "دینار کویت", "🇰🇼", "kwd1", "kwd2", "cur"),
+    Item("iqd", "دینار عراق", "🇮🇶", "iqd1", "iqd2", "cur"),
+    Item("bhd", "دینار بحرین", "🇧🇭", "bhd1", "bhd2", "cur"),
+    Item("omr", "ریال عمان", "🇴🇲", "omr1", "omr2", "cur"),
+    Item("qar", "ریال قطر", "🇶🇦", "qar1", "qar2", "cur"),
 ]
 
+COINS: List[Item] = [
+    Item("azadi", "سکه آزادی", "🪙", "azadi1", "azadi12", "coin"),
+    Item("emami", "سکه امامی", "🪙", "emami1", "emami12", "coin"),
+    Item("nim", "نیم سکه", "🪙", "azadi1_2", "azadi1_22", "coin"),
+    Item("rob", "ربع سکه", "🪙", "azadi1_4", "azadi1_42", "coin"),
+    Item("gerami", "سکه گرمی", "🪙", "azadi1g", "azadi1g2", "coin"),
+]
+
+METALS: List[Item] = [
+    Item("gold18", "طلا ۱۸ عیار", "⚜️", "gol18", None, "metal"),
+    Item("mithqal", "طلا مثقال", "⚜️", "mithqal", None, "metal"),
+    Item("ounce", "طلا اونس", "🌍", "ounce", None, "metal"),
+    Item("btc", "بیت‌کوین", "₿", "bitcoin", None, "metal"),
+]
+
+CATALOG: Dict[str, Item] = {i.code: i for i in (CURRENCIES + COINS + METALS)}
+CAT_BY_CAT: Dict[str, List[Item]] = {"cur": CURRENCIES, "coin": COINS, "metal": METALS}
+
+
+# ---------------- Config helpers ----------------
 
 def default_config() -> Dict[str, Any]:
     return {
-        "approved": False,
         "auto_send": False,
         "interval_min": 5,
-        "quiet": [],  # list of ["HH:MM","HH:MM"]
-        "only_on_change": False,
-        "threshold": 0.0,
-        "triggers": [],  # if empty => uses selected items
-        "mode": "sell",  # sell|buy
-        "send_mode": "post",  # post|edit
+        "quiet": "",  # e.g. "23:00-08:00"
+        "only_if_changed": False,
+        "sellbuy": "sell",  # sell|buy
+        "threshold": 0,  # abs threshold (toman). 0 disables
         "selected": {
-            "currencies": DEFAULT_CURRENCY_ORDER.copy(),
-            "coins": ["EMAMI", "AZADI", "NIM", "ROB", "GERAMI"],
-            "metals": ["GOL_MITHQAL", "GOL_GRAM", "GOL_OUNCE", "BTC"],
+            "cur": [i.code for i in CURRENCIES],
+            "coin": [i.code for i in COINS],
+            "metal": [i.code for i in METALS],
         },
+        # If empty -> triggers == all selected
+        "triggers": {"cur": [], "coin": [], "metal": []},
     }
 
 
-def fmt_int_like(v: Any) -> str:
+def is_admin(user_id: int, admin_ids: List[int]) -> bool:
+    return user_id in admin_ids
+
+
+def parse_quiet(s: str) -> Optional[Tuple[dtime, dtime]]:
+    # "HH:MM-HH:MM"
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$", s)
+    if not m:
+        return None
+    h1, m1, h2, m2 = map(int, m.groups())
+    if not (0 <= h1 <= 23 and 0 <= h2 <= 23 and 0 <= m1 <= 59 and 0 <= m2 <= 59):
+        return None
+    return dtime(h1, m1), dtime(h2, m2)
+
+
+def in_quiet(now: datetime, quiet: str) -> bool:
+    if not quiet:
+        return False
+    parsed = parse_quiet(quiet)
+    if not parsed:
+        return False
+    start, end = parsed
+    t = now.time()
+    if start == end:
+        return False
+    if start < end:
+        return start <= t < end
+    # wraps midnight
+    return t >= start or t < end
+
+
+def to_number(v: Any) -> Optional[float]:
     if v is None:
-        return ""
-    s = str(v).strip()
-    return s
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        s = v.strip().replace(",", "")
+        if s == "":
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    return None
 
 
-def arrow(sign: str) -> str:
-    # sign: up/down/same
-    if sign == "up":
-        return " ▲"
-    if sign == "down":
-        return " 🔻"
-    return ""
+def fmt_value(v: Any) -> str:
+    n = to_number(v)
+    if n is None:
+        return "-"
+    # decide int vs float display
+    if abs(n - round(n)) < 1e-9 and abs(n) >= 100:
+        return f"{int(round(n)):,}"
+    # keep 2 decimals for smaller/float values (ounce, btc)
+    return f"{n:,.2f}".rstrip("0").rstrip(".")
 
 
-class DataCache:
-    def __init__(self) -> None:
-        self.prev: Dict[str, float] = {}
-        self.signs: Dict[str, str] = {}
+def build_lines(section_items: List[Item], cfg: Dict[str, Any], data: Dict[str, Any], last: Dict[str, float]) -> Tuple[List[str], Dict[str, float], bool]:
+    """
+    Returns (lines, new_last_values, any_triggered_change)
+    """
+    sellbuy = cfg.get("sellbuy", "sell")
+    threshold = float(cfg.get("threshold", 0) or 0)
 
-    def update(self, json_data: Dict[str, Any], mode: str) -> None:
-        for code, item in ITEMS.items():
-            v = BonbastClient.get_value_float(item, json_data, mode)
-            if v is None:
-                continue
-            old = self.prev.get(code)
-            if old is None:
-                self.signs[code] = "same"
-            else:
-                if v > old:
-                    self.signs[code] = "up"
-                elif v < old:
-                    self.signs[code] = "down"
-                else:
-                    self.signs[code] = "same"
-            self.prev[code] = v
-
-
-def in_quiet(now_hm: str, quiet: List[List[str]]) -> bool:
-    # quiet: [["23:00","07:30"], ["12:00","13:00"]]
-    def to_min(hm: str) -> int:
-        h, m = hm.split(":")
-        return int(h) * 60 + int(m)
-
-    nowm = to_min(now_hm)
-    for a, b in quiet or []:
-        am, bm = to_min(a), to_min(b)
-        if am == bm:
-            continue
-        if am < bm:
-            if am <= nowm < bm:
-                return True
-        else:
-            # wraps midnight
-            if nowm >= am or nowm < bm:
-                return True
-    return False
-
-
-def parse_quiet_ranges(text: str) -> List[List[str]]:
-    # "23:00-07:30,12:00-13:00"
-    out: List[List[str]] = []
-    t = text.strip()
-    if not t:
-        return out
-    parts = [p.strip() for p in t.split(",") if p.strip()]
-    for p in parts:
-        if "-" not in p:
-            continue
-        a, b = [x.strip() for x in p.split("-", 1)]
-        if not re.match(r"^\d{2}:\d{2}$", a) or not re.match(r"^\d{2}:\d{2}$", b):
-            continue
-        out.append([a, b])
-    return out
-
-
-def build_message(cfg: Dict[str, Any], json_data: Dict[str, Any], signs: Dict[str, str], first_post_no_arrow: bool) -> str:
-    mode = cfg.get("mode", "sell")
-    selected = cfg.get("selected", {})
-    cur = selected.get("currencies", []) or DEFAULT_CURRENCY_ORDER
-    coins = selected.get("coins", [])
-    metals = selected.get("metals", [])
+    selected_codes = cfg.get("selected", {}).get(section_items[0].category, [])
+    trigger_codes = cfg.get("triggers", {}).get(section_items[0].category, []) or selected_codes
 
     lines: List[str] = []
+    new_last: Dict[str, float] = dict(last)
+    changed = False
 
-    # currencies
-    for code in cur:
-        item = ITEMS.get(code)
-        if not item:
+    for it in section_items:
+        if it.code not in selected_codes:
             continue
-        price = fmt_int_like(json_data.get(item.sell_key if mode == "sell" else item.buy_key))
-        if not price:
-            continue
-        s = "" if first_post_no_arrow else arrow(signs.get(code, "same"))
-        # emoji already correct: USD/EUR/GBP money emoji; others flag
-        lines.append(f"{item.emoji} {item.fa} {price}{s}")
 
-    # coins section
-    if coins:
-        lines.append(SEP)
-        for code in coins:
-            item = ITEMS.get(code)
-            if not item:
-                continue
-            price = fmt_int_like(json_data.get(item.sell_key if mode == "sell" else item.buy_key))
-            if not price:
-                continue
-            s = "" if first_post_no_arrow else arrow(signs.get(code, "same"))
-            lines.append(f"{item.emoji} {item.fa} {price}{s}")
+        key = it.sell_key if sellbuy == "sell" or not it.buy_key else it.buy_key
+        raw = data.get(key)
+        num = to_number(raw)
+        value_str = fmt_value(raw)
 
-    # metals/BTC section
-    if metals:
-        lines.append(SEP)
-        for code in metals:
-            item = ITEMS.get(code)
-            if not item:
-                continue
-            price = fmt_int_like(json_data.get(item.sell_key))
-            if not price:
-                continue
-            s = "" if first_post_no_arrow else arrow(signs.get(code, "same"))
-            lines.append(f"{item.emoji} {item.fa} {price}{s}")
+        arrow = ""
+        if num is not None and it.code in last:
+            prev = last[it.code]
+            if num > prev + 1e-9:
+                arrow = " ▲"
+            elif num < prev - 1e-9:
+                arrow = " 🔻"
 
-    # date/time (from bonbast json)
-    # year/month/day/hour/minute are in json (Tehran time)
-    try:
-        y = str(json_data.get("year", "")).strip()
-        mo = str(json_data.get("month", "")).strip().zfill(2)
-        d = str(json_data.get("day", "")).strip().zfill(2)
-        hh = str(json_data.get("hour", "")).strip().zfill(2)
-        mm = str(json_data.get("minute", "")).strip().zfill(2)
-        if y and mo and d and hh and mm:
-            lines.append(SEP)
-            lines.append(f"{y}/{mo}/{d} - {hh}:{mm}")
-    except Exception:
-        pass
+            if it.code in trigger_codes:
+                if threshold <= 0:
+                    if abs(num - prev) > 1e-9:
+                        changed = True
+                else:
+                    if abs(num - prev) >= threshold:
+                        changed = True
 
-    return "\n".join(lines).strip()
+        # store last value (even if unchanged) to keep comparisons fresh
+        if num is not None:
+            new_last[it.code] = num
+
+        # RTL mark at line start improves layout in mixed RTL+numbers
+        rtl = "\u200f"
+        lines.append(f"{rtl}{it.emoji} {it.fa} : {value_str}{arrow}")
+
+    return lines, new_last, changed
 
 
-# ---------- UI / Keyboards ----------
+def now_slot_tehran(now: datetime) -> str:
+    return now.strftime("%Y/%m/%d %H:%M")
+
+
+# ---------------- UI keyboards ----------------
 
 def kb_chat_list(chats: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
-    for rec in chats:
-        ap = "✅" if rec["approved"] else "⏳"
-        auto = "🟢" if rec["config"].get("auto_send") else "🔴"
-        title = rec["title"]
-        rows.append([InlineKeyboardButton(f"{ap}{auto} {title}", callback_data=f"chat:{rec['chat_id']}")])
-    return InlineKeyboardMarkup(rows or [[InlineKeyboardButton("No chats yet — add bot to a group/channel first", callback_data="noop")]])
+    for ch in chats:
+        icon = "✅" if ch["approved"] else "⏳"
+        title = ch["title"] or str(ch["chat_id"])
+        rows.append([InlineKeyboardButton(f"{icon} {title}", callback_data=f"sel|{ch['chat_id']}")])
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh|0")])
+    return InlineKeyboardMarkup(rows)
 
 
-def build_panel_keyboard(rec: Dict[str, Any]) -> InlineKeyboardMarkup:
-    cfg = rec["config"] or default_config()
-    approved = rec["approved"]
-    auto = bool(cfg.get("auto_send"))
-    onlychg = bool(cfg.get("only_on_change"))
-    mode = cfg.get("mode", "sell")
-    send_mode = cfg.get("send_mode", "post")
+def kb_main(chat_id: int, approved: bool, cfg: Dict[str, Any]) -> InlineKeyboardMarkup:
+    auto = "✅ فعال" if cfg.get("auto_send") else "❌ غیرفعال"
+    ap = "✅ تایید شده" if approved else "⏳ نیاز به تایید"
 
-    status_txt = f"وضعیت: {'✅ تایید' if approved else '⏳ نیاز به تایید'}"
-    auto_txt = f"ارسال خودکار: {'✅ فعال' if auto else '❌ غیرفعال'}"
-    mode_txt = "Sell" if mode == "sell" else "Buy"
-    sendmode_txt = "Post" if send_mode == "post" else "Edit"
-
-    cid = rec["chat_id"]
-
-    rows: List[List[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(status_txt, callback_data=f"toggle:approve:{cid}")],
-        [InlineKeyboardButton(auto_txt, callback_data=f"toggle:auto:{cid}")],
+    rows = [
+        [InlineKeyboardButton(f"وضعیت : {ap}", callback_data=f"approve|{chat_id}")],
+        [InlineKeyboardButton(f"ارسال خودکار : {auto}", callback_data=f"auto|{chat_id}")],
         [
-            InlineKeyboardButton("انتخاب ارزها", callback_data=f"pick:curr:{cid}:0"),
-            InlineKeyboardButton("انتخاب سکه‌ها", callback_data=f"pick:coin:{cid}:0"),
-        ],
-        [InlineKeyboardButton("طلا / بیتکوین", callback_data=f"pick:metal:{cid}:0")],
-        [
-            InlineKeyboardButton("زمان‌بندی (Interval)", callback_data=f"set:interval:{cid}"),
-            InlineKeyboardButton("ساعات سکوت", callback_data=f"set:quiet:{cid}"),
+            InlineKeyboardButton("انتخاب ارزها", callback_data=f"menu|{chat_id}|cur"),
+            InlineKeyboardButton("انتخاب سکه‌ها", callback_data=f"menu|{chat_id}|coin"),
         ],
         [
-            InlineKeyboardButton("فقط در صورت تغییر" + (" ✅" if onlychg else " ❌"), callback_data=f"toggle:onlychg:{cid}"),
-            InlineKeyboardButton("Triggers", callback_data=f"pick:trig:{cid}:0"),
+            InlineKeyboardButton("طلا / بیت‌کوین", callback_data=f"menu|{chat_id}|metal"),
         ],
         [
-            InlineKeyboardButton(f"Sell/Buy: {mode_txt}", callback_data=f"toggle:mode:{cid}"),
-            InlineKeyboardButton(f"Send mode: {sendmode_txt}", callback_data=f"toggle:sendmode:{cid}"),
+            InlineKeyboardButton("زمانبندی (Interval)", callback_data=f"menu|{chat_id}|interval"),
+            InlineKeyboardButton("ساعات سکوت", callback_data=f"menu|{chat_id}|quiet"),
         ],
         [
-            InlineKeyboardButton("Threshold", callback_data=f"set:threshold:{cid}"),
-            InlineKeyboardButton("ارسال فوری (Send now)", callback_data=f"sendnow:{cid}"),
+            InlineKeyboardButton("فقط در صورت تغییر", callback_data=f"toggle|{chat_id}|only"),
+            InlineKeyboardButton("تریگرها", callback_data=f"menu|{chat_id}|triggers"),
         ],
         [
-            InlineKeyboardButton("ترتیب ارزها", callback_data=f"set:order:{cid}"),
-            InlineKeyboardButton("Export config", callback_data=f"export:{cid}"),
+            InlineKeyboardButton("Sell/Buy", callback_data=f"menu|{chat_id}|sellbuy"),
+            InlineKeyboardButton("Threshold", callback_data=f"menu|{chat_id}|threshold"),
         ],
-        [InlineKeyboardButton("Help", callback_data="help")],
+        [
+            InlineKeyboardButton("ارسال فوری (Send now)", callback_data=f"sendnow|{chat_id}"),
+            InlineKeyboardButton("تست ارسال", callback_data=f"test|{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton("Export config", callback_data=f"export|{chat_id}"),
+            InlineKeyboardButton("Help", callback_data="help|0"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Back to chats", callback_data="back|0"),
+        ],
     ]
     return InlineKeyboardMarkup(rows)
 
 
-def build_picker(kind: str, chat_id: int, cfg: Dict[str, Any], page: int) -> InlineKeyboardMarkup:
-    # kind: curr|coin|metal|trig
-    sel = cfg.setdefault("selected", {})
-    if kind == "trig":
-        selected = set(cfg.get("triggers", []) or [])
-        keys = [k for k, it in ITEMS.items() if it.kind in ("currency", "coin", "metal")]
-        title = "Triggers"
-    else:
-        map_name = {"curr": "currencies", "coin": "coins", "metal": "metals"}[kind]
-        selected = set(sel.get(map_name, []) or [])
-        keys = [k for k, it in ITEMS.items() if it.kind == ("currency" if kind == "curr" else "coin" if kind == "coin" else "metal")]
-        title = map_name
-
-    keys.sort()
-
-    per_page = 18
-    start = page * per_page
-    chunk = keys[start:start + per_page]
-
+def kb_items(chat_id: int, cat: str, cfg: Dict[str, Any]) -> InlineKeyboardMarkup:
+    items = CAT_BY_CAT[cat]
+    selected = cfg.get("selected", {}).get(cat, [])
     rows: List[List[InlineKeyboardButton]] = []
-    # 2 columns like your screenshot
-    for i in range(0, len(chunk), 2):
-        row: List[InlineKeyboardButton] = []
-        for k in chunk[i:i + 2]:
-            it = ITEMS[k]
-            mark = "✅" if k in selected else "❌"
-            row.append(InlineKeyboardButton(f"{it.fa} {mark}", callback_data=f"pick:toggle:{kind}:{chat_id}:{k}:{page}"))
+    row: List[InlineKeyboardButton] = []
+    for it in items:
+        on = it.code in selected
+        label = f"{it.fa} {'✅' if on else '❌'}"
+        row.append(InlineKeyboardButton(label, callback_data=f"togitem|{chat_id}|{cat}|{it.code}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
         rows.append(row)
 
-    nav: List[InlineKeyboardButton] = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"pick:{kind}:{chat_id}:{page-1}"))
-    nav.append(InlineKeyboardButton("Done", callback_data=f"pick:done:{kind}:{chat_id}"))
-    if start + per_page < len(keys):
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"pick:{kind}:{chat_id}:{page+1}"))
-    rows.append(nav)
-
+    rows.append([
+        InlineKeyboardButton("✅ Select all", callback_data=f"all|{chat_id}|{cat}|1"),
+        InlineKeyboardButton("❌ Clear all", callback_data=f"all|{chat_id}|{cat}|0"),
+    ])
+    rows.append([
+        InlineKeyboardButton("🔁 Reset order", callback_data=f"resetorder|{chat_id}|{cat}"),
+        InlineKeyboardButton("⬅️ Back", callback_data=f"panel|{chat_id}"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 
-# ---------- Commands ----------
+def kb_triggers(chat_id: int, cfg: Dict[str, Any]) -> InlineKeyboardMarkup:
+    # choose which category first
+    rows = [
+        [InlineKeyboardButton("تریگر ارزها", callback_data=f"trigcat|{chat_id}|cur")],
+        [InlineKeyboardButton("تریگر سکه‌ها", callback_data=f"trigcat|{chat_id}|coin")],
+        [InlineKeyboardButton("تریگر طلا/بیت‌کوین", callback_data=f"trigcat|{chat_id}|metal")],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"panel|{chat_id}")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
-HELP_TEXT = (
-    "سلام!\n\n"
-    "✅ /register\n"
-    "داخل گروه/کانال اجرا کنید تا در لیست مدیریت ثبت شود.\n\n"
-    "✅ /panel\n"
-    "پنل مدیریت (همه تنظیمات هر چت جداگانه).\n\n"
-    "نکته: برای اینکه بات بتواند در کانال پیام بفرستد باید Admin باشد و اجازه Post داشته باشد.\n"
-)
 
+def kb_trig_items(chat_id: int, cat: str, cfg: Dict[str, Any]) -> InlineKeyboardMarkup:
+    selected = cfg.get("selected", {}).get(cat, [])
+    triggers = cfg.get("triggers", {}).get(cat, [])
+    items = [CATALOG[c] for c in selected if c in CATALOG]
+
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for it in items:
+        on = it.code in triggers
+        label = f"{it.fa} {'✅' if on else '❌'}"
+        row.append(InlineKeyboardButton(label, callback_data=f"togtrig|{chat_id}|{cat}|{it.code}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    rows.append([
+        InlineKeyboardButton("✅ همه تریگر شوند", callback_data=f"trigall|{chat_id}|{cat}|1"),
+        InlineKeyboardButton("⬜️ تریگر = همه منتخب‌ها", callback_data=f"trigall|{chat_id}|{cat}|0"),
+    ])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"menu|{chat_id}|triggers")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_interval(chat_id: int, cfg: Dict[str, Any]) -> InlineKeyboardMarkup:
+    cur = int(cfg.get("interval_min", 5) or 5)
+    rows = [
+        [
+            InlineKeyboardButton("5", callback_data=f"setint|{chat_id}|5"),
+            InlineKeyboardButton("10", callback_data=f"setint|{chat_id}|10"),
+            InlineKeyboardButton("15", callback_data=f"setint|{chat_id}|15"),
+        ],
+        [
+            InlineKeyboardButton("30", callback_data=f"setint|{chat_id}|30"),
+            InlineKeyboardButton("60", callback_data=f"setint|{chat_id}|60"),
+            InlineKeyboardButton("Custom…", callback_data=f"ask|{chat_id}|interval"),
+        ],
+        [InlineKeyboardButton(f"فعلی: {cur} دقیقه", callback_data="noop|0")],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"panel|{chat_id}")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_quiet(chat_id: int, cfg: Dict[str, Any]) -> InlineKeyboardMarkup:
+    q = cfg.get("quiet", "")
+    rows = [
+        [InlineKeyboardButton(f"فعلی: {q or 'خاموش'}", callback_data="noop|0")],
+        [
+            InlineKeyboardButton("Set… (مثال 23:00-08:00)", callback_data=f"ask|{chat_id}|quiet"),
+            InlineKeyboardButton("Clear", callback_data=f"clearquiet|{chat_id}"),
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"panel|{chat_id}")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_sellbuy(chat_id: int, cfg: Dict[str, Any]) -> InlineKeyboardMarkup:
+    cur = cfg.get("sellbuy", "sell")
+    rows = [
+        [
+            InlineKeyboardButton(f"Sell {'✅' if cur=='sell' else ''}", callback_data=f"setsb|{chat_id}|sell"),
+            InlineKeyboardButton(f"Buy {'✅' if cur=='buy' else ''}", callback_data=f"setsb|{chat_id}|buy"),
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"panel|{chat_id}")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_threshold(chat_id: int, cfg: Dict[str, Any]) -> InlineKeyboardMarkup:
+    th = cfg.get("threshold", 0) or 0
+    rows = [
+        [InlineKeyboardButton(f"فعلی: {th}", callback_data="noop|0")],
+        [
+            InlineKeyboardButton("0 (خاموش)", callback_data=f"setth|{chat_id}|0"),
+            InlineKeyboardButton("1000", callback_data=f"setth|{chat_id}|1000"),
+            InlineKeyboardButton("5000", callback_data=f"setth|{chat_id}|5000"),
+        ],
+        [InlineKeyboardButton("Custom…", callback_data=f"ask|{chat_id}|threshold")],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"panel|{chat_id}")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+# ---------------- Bot handlers ----------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("سلام!\npanel/ برای مدیریت\nregister/ برای ثبت گروه/کانال")
+    text = (
+        "سلام!\n"
+        "برای مدیریت: /panel\n"
+        "برای ثبت چت (گروه/کانال): /register (داخل همان چت)\n"
+    )
+    await update.effective_message.reply_text(text)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(HELP_TEXT)
-
-
-async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    admin_ids = context.application.bot_data["admin_ids"]
-    if not is_admin(update, admin_ids):
-        return
-
-    st: Storage = context.application.bot_data["storage"]
-    chat = update.effective_chat
-    title = (chat.title or chat.username or str(chat.id)).strip()
-    st.upsert_chat(chat.id, title, chat.type)
-    await update.effective_message.reply_text("✅ ثبت شد. وضعیت: ⏳ نیاز به تایید (از /panel تایید کنید).")
+    msg = (
+        "راهنما:\n"
+        "- اول در پی‌وی به ربات /start بدهید (برای اینکه ربات بتواند به شما پیام بدهد)\n"
+        "- ربات را به گروه/کانال اضافه کنید (برای کانال بهتر است ادمینش کنید تا بتواند ارسال کند)\n"
+        "- سپس /panel → تایید (Approve) کنید\n"
+        "- ارسال خودکار را روشن کنید و Interval را تنظیم کنید\n"
+        "- اگر «فقط در صورت تغییر» را روشن کنید، فقط وقتی تریگرها تغییر کنند پیام می‌فرستد\n\n"
+        "نکته ترتیب:\n"
+        "ترتیب نمایش = ترتیب انتخاب شماست. اگر ترتیب جدید می‌خواهید: Reset order → دوباره به ترتیب انتخاب کنید."
+    )
+    await update.effective_message.reply_text(msg)
 
 
 async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    admin_ids = context.application.bot_data["admin_ids"]
-    if not is_admin(update, admin_ids):
+    admin_ids = context.bot_data["ADMIN_IDS"]
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid, admin_ids):
+        await update.effective_message.reply_text("⛔️ دسترسی ندارید.")
         return
-    st: Storage = context.application.bot_data["storage"]
+
+    st: Storage = context.bot_data["STORAGE"]
     chats = st.list_chats()
+    if not chats:
+        await update.effective_message.reply_text("هیچ چتی ثبت نشده. ربات را به گروه/کانال اضافه کنید یا /register بزنید.")
+        return
     await update.effective_message.reply_text("Select a chat to manage:", reply_markup=kb_chat_list(chats))
 
 
-# ---------- Updates / Callbacks ----------
-
-async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    admin_ids = context.application.bot_data["admin_ids"]
-    st: Storage = context.application.bot_data["storage"]
-    logger = logging.getLogger("bonbast-bot")
-
+async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Must be called inside the target group/supergroup/channel
     chat = update.effective_chat
     if not chat:
         return
+    if chat.type == "private":
+        await update.effective_message.reply_text("این دستور را داخل گروه/کانال اجرا کنید.")
+        return
 
-    new_status = update.my_chat_member.new_chat_member.status
-    old_status = update.my_chat_member.old_chat_member.status
+    st: Storage = context.bot_data["STORAGE"]
+    st.upsert_chat(chat.id, chat.title or chat.username or str(chat.id), chat.type)
+    await update.effective_message.reply_text("✅ ثبت شد. برای تایید از /panel در پی‌وی استفاده کنید.")
 
-    title = (chat.title or chat.username or str(chat.id)).strip()
 
-    if new_status in ("member", "administrator") and old_status in ("kicked", "left"):
-        st.upsert_chat(chat.id, title, chat.type)
-        logger.info("Bot added to chat %s (%s)", title, chat.id)
-        # notify admins
-        for aid in admin_ids:
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Detect bot added/removed
+    m = update.my_chat_member
+    if not m:
+        return
+    chat = m.chat
+    new_status = m.new_chat_member.status
+    st: Storage = context.bot_data["STORAGE"]
+
+    if new_status in ("member", "administrator"):
+        st.upsert_chat(chat.id, chat.title or chat.username or str(chat.id), chat.type)
+        # DM admins (only if they started bot already)
+        for aid in context.bot_data["ADMIN_IDS"]:
             try:
                 await context.bot.send_message(
                     chat_id=aid,
-                    text=f"➕ Bot added to: {title}\nID: {chat.id}\n⏳ نیاز به تایید از /panel",
+                    text=f"🆕 Bot added to: {chat.title or chat.id}\nID: {chat.id}\n/panel → approve",
                 )
             except Exception:
                 pass
-
-    if new_status in ("kicked", "left"):
-        logger.info("Bot removed from chat %s (%s)", title, chat.id)
-        st.delete_chat(chat.id)
-
-
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    await q.answer()
-
-    admin_ids = context.application.bot_data["admin_ids"]
-    if update.effective_user and update.effective_user.id not in admin_ids:
-        return
-
-    st: Storage = context.application.bot_data["storage"]
-    data = q.data or ""
-
-    if data == "noop":
-        return
-
-    if data == "help":
-        await q.message.reply_text(HELP_TEXT)
-        return
-
-    if data.startswith("chat:"):
-        chat_id = int(data.split(":")[1])
-        rec = st.get_chat(chat_id)
-        if not rec:
-            await q.message.edit_text("Chat not found.")
-            return
-        # ensure config exists
-        cfg = rec["config"] or default_config()
-        if not cfg:
-            cfg = default_config()
-        st.save_config(chat_id, cfg)
-        await q.message.edit_text(f"Control Panel: {rec['title']} ({chat_id})", reply_markup=build_panel_keyboard(rec))
-        return
-
-    # Toggles
-    if data.startswith("toggle:approve:"):
-        chat_id = int(data.split(":")[-1])
-        rec = st.get_chat(chat_id)
-        if not rec:
-            return
-        new_val = not rec["approved"]
-        st.set_approved(chat_id, new_val)
-        rec = st.get_chat(chat_id)  # refresh
-        await q.message.edit_text(f"Control Panel: {rec['title']} ({chat_id})", reply_markup=build_panel_keyboard(rec))
-        return
-
-    if data.startswith("toggle:auto:"):
-        chat_id = int(data.split(":")[-1])
-        rec = st.get_chat(chat_id)
-        if not rec:
-            return
-        cfg = rec["config"] or default_config()
-        cfg["auto_send"] = not bool(cfg.get("auto_send"))
-        st.save_config(chat_id, cfg)
-        rec = st.get_chat(chat_id)
-        await q.message.edit_text(f"Control Panel: {rec['title']} ({chat_id})", reply_markup=build_panel_keyboard(rec))
-        return
-
-    if data.startswith("toggle:onlychg:"):
-        chat_id = int(data.split(":")[-1])
-        rec = st.get_chat(chat_id)
-        if not rec:
-            return
-        cfg = rec["config"] or default_config()
-        cfg["only_on_change"] = not bool(cfg.get("only_on_change"))
-        st.save_config(chat_id, cfg)
-        rec = st.get_chat(chat_id)
-        await q.message.edit_text(f"Control Panel: {rec['title']} ({chat_id})", reply_markup=build_panel_keyboard(rec))
-        return
-
-    if data.startswith("toggle:mode:"):
-        chat_id = int(data.split(":")[-1])
-        rec = st.get_chat(chat_id)
-        if not rec:
-            return
-        cfg = rec["config"] or default_config()
-        cfg["mode"] = "buy" if cfg.get("mode") == "sell" else "sell"
-        st.save_config(chat_id, cfg)
-        rec = st.get_chat(chat_id)
-        await q.message.edit_text(f"Control Panel: {rec['title']} ({chat_id})", reply_markup=build_panel_keyboard(rec))
-        return
-
-    if data.startswith("toggle:sendmode:"):
-        chat_id = int(data.split(":")[-1])
-        rec = st.get_chat(chat_id)
-        if not rec:
-            return
-        cfg = rec["config"] or default_config()
-        cfg["send_mode"] = "edit" if cfg.get("send_mode") == "post" else "post"
-        st.save_config(chat_id, cfg)
-        rec = st.get_chat(chat_id)
-        await q.message.edit_text(f"Control Panel: {rec['title']} ({chat_id})", reply_markup=build_panel_keyboard(rec))
-        return
-
-    # Set inputs
-    if data.startswith("set:interval:"):
-        chat_id = int(data.split(":")[-1])
-        context.user_data["awaiting"] = ("interval", chat_id)
-        await q.message.reply_text("Interval را به دقیقه بفرستید.\nمثال: 5")
-        return
-
-    if data.startswith("set:threshold:"):
-        chat_id = int(data.split(":")[-1])
-        context.user_data["awaiting"] = ("threshold", chat_id)
-        await q.message.reply_text("Threshold را بفرستید (حداقل مقدار تغییر).\nمثال: 100\n0 یعنی هر تغییر.")
-        return
-
-    if data.startswith("set:quiet:"):
-        chat_id = int(data.split(":")[-1])
-        context.user_data["awaiting"] = ("quiet", chat_id)
-        await q.message.reply_text("ساعات سکوت را بفرستید. مثال:\n23:00-07:30\nیا چند بازه:\n12:00-13:00,23:00-07:30\n(خالی = بدون سکوت)")
-        return
-
-    if data.startswith("set:order:"):
-        chat_id = int(data.split(":")[-1])
-        context.user_data["awaiting"] = ("order", chat_id)
-        await q.message.reply_text("ترتیب ارزها را با کُدها بفرستید (با فاصله یا کاما).\nمثال:\nUSD EUR GBP CHF AED")
-        return
-
-    # Picker pages
-    if data.startswith("pick:curr:") or data.startswith("pick:coin:") or data.startswith("pick:metal:") or data.startswith("pick:trig:"):
-        _, kind, chat_id, page = data.split(":")
-        chat_id = int(chat_id)
-        page = int(page)
-        rec = st.get_chat(chat_id)
-        if not rec:
-            return
-        cfg = rec["config"] or default_config()
-        await q.message.edit_text("انتخاب کنید:", reply_markup=build_picker(kind, chat_id, cfg, page))
-        return
-
-    if data.startswith("pick:toggle:"):
-        _, _, kind, chat_id, key, page = data.split(":")
-        chat_id = int(chat_id)
-        page = int(page)
-        rec = st.get_chat(chat_id)
-        if not rec:
-            return
-        cfg = rec["config"] or default_config()
-
-        if kind == "trig":
-            lst = cfg.setdefault("triggers", [])
-        else:
-            map_name = {"curr": "currencies", "coin": "coins", "metal": "metals"}[kind]
-            lst = cfg.setdefault("selected", {}).setdefault(map_name, [])
-
-        if key in lst:
-            lst.remove(key)
-        else:
-            lst.append(key)
-
-        st.save_config(chat_id, cfg)
-        await q.message.edit_text("انتخاب کنید:", reply_markup=build_picker(kind, chat_id, cfg, page))
-        return
-
-    if data.startswith("pick:done:"):
-        _, _, kind, chat_id = data.split(":")
-        chat_id = int(chat_id)
-        rec = st.get_chat(chat_id)
-        if not rec:
-            return
-        await q.message.edit_text(f"Control Panel: {rec['title']} ({chat_id})", reply_markup=build_panel_keyboard(rec))
-        return
-
-    if data.startswith("export:"):
-        chat_id = int(data.split(":")[-1])
-        rec = st.get_chat(chat_id)
-        if not rec:
-            return
-        await q.message.reply_text(json.dumps(rec["config"] or {}, ensure_ascii=False, indent=2))
-        return
-
-    if data.startswith("sendnow:"):
-        chat_id = int(data.split(":")[-1])
-        await send_to_chat(context.application, chat_id, force=True)
-        await q.message.reply_text("✅ ارسال شد.")
-        return
+    elif new_status in ("left", "kicked"):
+        st.remove_chat(chat.id)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    admin_ids = context.application.bot_data["admin_ids"]
-    if not is_admin(update, admin_ids):
+    # Handle custom inputs requested by buttons
+    admin_ids = context.bot_data["ADMIN_IDS"]
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid, admin_ids):
+        return
+    if update.effective_chat and update.effective_chat.type != "private":
         return
 
-    awaiting = context.user_data.get("awaiting")
-    if not awaiting:
+    pending = context.user_data.get("PENDING")
+    if not pending:
         return
 
-    st: Storage = context.application.bot_data["storage"]
-    kind, chat_id = awaiting
-    text = (update.effective_message.text or "").strip()
-    rec = st.get_chat(chat_id)
-    if not rec:
-        context.user_data.pop("awaiting", None)
+    chat_id = int(pending["chat_id"])
+    kind = pending["kind"]
+    txt = (update.effective_message.text or "").strip()
+
+    st: Storage = context.bot_data["STORAGE"]
+    ch = st.get_chat(chat_id)
+    if not ch:
+        await update.effective_message.reply_text("چت پیدا نشد.")
+        context.user_data.pop("PENDING", None)
         return
+    cfg = ch["config"] or default_config()
 
-    cfg = rec["config"] or default_config()
-
-    try:
-        if kind == "interval":
-            v = int(text)
-            if v < 1 or v > 360:
+    if kind == "interval":
+        try:
+            n = int(txt)
+            if n < 1 or n > 1440:
                 raise ValueError()
-            cfg["interval_min"] = v
-            st.save_config(chat_id, cfg)
+            cfg["interval_min"] = n
+            st.set_config(chat_id, cfg)
             await update.effective_message.reply_text("✅ Interval ذخیره شد.")
-        elif kind == "threshold":
-            v = float(text.replace(",", ""))
-            if v < 0:
-                raise ValueError()
-            cfg["threshold"] = v
-            st.save_config(chat_id, cfg)
-            await update.effective_message.reply_text("✅ Threshold ذخیره شد.")
-        elif kind == "quiet":
-            cfg["quiet"] = parse_quiet_ranges(text)
-            st.save_config(chat_id, cfg)
-            await update.effective_message.reply_text("✅ ساعات سکوت ذخیره شد.")
-        elif kind == "order":
-            parts = re.split(r"[,\s]+", text.upper().strip())
-            parts = [p for p in parts if p]
-            valid = [p for p in parts if p in ITEMS and ITEMS[p].kind == "currency"]
-            if not valid:
-                await update.effective_message.reply_text("❌ کُدها معتبر نیستند.\nمثال: USD EUR GBP CHF")
+        except Exception:
+            await update.effective_message.reply_text("فرمت اشتباه. مثال: 5 یا 10 یا 15")
+    elif kind == "quiet":
+        if txt == "" or txt.lower() == "off":
+            cfg["quiet"] = ""
+            st.set_config(chat_id, cfg)
+            await update.effective_message.reply_text("✅ ساعات سکوت خاموش شد.")
+        else:
+            if not parse_quiet(txt):
+                await update.effective_message.reply_text("فرمت اشتباه. مثال: 23:00-08:00")
             else:
-                sel = cfg.setdefault("selected", {}).setdefault("currencies", [])
-                new_order: List[str] = []
-                for p in valid:
-                    if p in sel and p not in new_order:
-                        new_order.append(p)
-                for p in sel:
-                    if p not in new_order:
-                        new_order.append(p)
-                cfg["selected"]["currencies"] = new_order
-                st.save_config(chat_id, cfg)
-                await update.effective_message.reply_text("✅ ترتیب ارزها ذخیره شد.")
-    finally:
-        context.user_data.pop("awaiting", None)
+                cfg["quiet"] = txt
+                st.set_config(chat_id, cfg)
+                await update.effective_message.reply_text("✅ ساعات سکوت ذخیره شد.")
+    elif kind == "threshold":
+        try:
+            n = int(txt)
+            if n < 0:
+                raise ValueError()
+            cfg["threshold"] = n
+            st.set_config(chat_id, cfg)
+            await update.effective_message.reply_text("✅ Threshold ذخیره شد.")
+        except Exception:
+            await update.effective_message.reply_text("عدد صحیح وارد کنید. مثال: 0 یا 1000")
+    elif kind == "import":
+        try:
+            obj = json.loads(txt)
+            if not isinstance(obj, dict):
+                raise ValueError()
+            # only accept known keys
+            merged = default_config()
+            merged.update({k: obj.get(k, merged.get(k)) for k in merged.keys()})
+            st.set_config(chat_id, merged)
+            await update.effective_message.reply_text("✅ Import انجام شد.")
+        except Exception:
+            await update.effective_message.reply_text("JSON نامعتبر است.")
+    context.user_data.pop("PENDING", None)
+
+    # Show panel again
+    ch2 = st.get_chat(chat_id)
+    await update.effective_message.reply_text(
+        f"Control Panel: {ch2['title']}",
+        reply_markup=kb_main(chat_id, bool(ch2["approved"]), ch2["config"] or default_config()),
+    )
 
 
-# ---------- Sender ----------
-
-async def send_to_chat(app: Application, chat_id: int, force: bool = False) -> None:
-    st: Storage = app.bot_data["storage"]
-    client: BonbastClient = app.bot_data["client"]
-    cache: DataCache = app.bot_data["data_cache"]
-
-    rec = st.get_chat(chat_id)
-    if not rec:
+async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
         return
-    if not rec["approved"]:
+    await q.answer()
+
+    admin_ids = context.bot_data["ADMIN_IDS"]
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid, admin_ids):
+        await q.edit_message_text("⛔️ دسترسی ندارید.")
         return
 
-    cfg = rec["config"] or default_config()
-    json_data = await client.fetch_json()
+    st: Storage = context.bot_data["STORAGE"]
+    data = (q.data or "")
+    parts = data.split("|")
 
-    # update arrows based on SELL (direction only)
-    cache.update(json_data, "sell")
+    action = parts[0]
 
-    state = rec["state"] or {}
-    last_sent_vals = state.get("last_sent_vals", {})
-    last_message_id = state.get("last_message_id")
-    first_post_done = bool(state.get("first_post_done", False))
+    if action == "noop":
+        return
 
-    msg = build_message(cfg, json_data, cache.signs, first_post_no_arrow=(not first_post_done))
+    if action in ("refresh", "back"):
+        chats = st.list_chats()
+        await q.edit_message_text("Select a chat to manage:", reply_markup=kb_chat_list(chats))
+        return
 
-    if cfg.get("only_on_change") and not force:
-        threshold = float(cfg.get("threshold", 0.0) or 0.0)
-        triggers = cfg.get("triggers", [])
-        if not triggers:
-            selected = cfg.get("selected", {})
-            triggers = list(selected.get("currencies", [])) + list(selected.get("coins", [])) + list(selected.get("metals", []))
+    if action == "help":
+        await q.edit_message_text("برای راهنما /help را بزنید.")
+        return
 
-        changed = False
-        for k in triggers:
-            item = ITEMS.get(k)
-            if not item:
-                continue
-            cur = BonbastClient.get_value_float(item, json_data, cfg.get("mode", "sell"))
-            prev = last_sent_vals.get(k)
-            if cur is None:
-                continue
-            if prev is None:
-                changed = True
-                break
-            if abs(cur - float(prev)) >= threshold:
-                changed = True
-                break
-        if not changed:
+    if action == "sel":
+        chat_id = int(parts[1])
+        ch = st.get_chat(chat_id)
+        if not ch:
+            await q.edit_message_text("چت پیدا نشد.")
+            return
+        cfg = ch["config"] or default_config()
+        await q.edit_message_text(f"Control Panel: {ch['title']}", reply_markup=kb_main(chat_id, bool(ch["approved"]), cfg))
+        return
+
+    # Everything below needs chat_id
+    chat_id = int(parts[1]) if len(parts) > 1 else 0
+    ch = st.get_chat(chat_id)
+    if not ch:
+        await q.edit_message_text("چت پیدا نشد.")
+        return
+    cfg = ch["config"] or default_config()
+
+    if action == "panel":
+        await q.edit_message_text(f"Control Panel: {ch['title']}", reply_markup=kb_main(chat_id, bool(ch["approved"]), cfg))
+        return
+
+    if action == "approve":
+        st.set_approved(chat_id, not bool(ch["approved"]))
+        ch2 = st.get_chat(chat_id)
+        await q.edit_message_text(
+            f"Control Panel: {ch2['title']}",
+            reply_markup=kb_main(chat_id, bool(ch2["approved"]), ch2["config"] or default_config()),
+        )
+        return
+
+    if action == "auto":
+        cfg["auto_send"] = not bool(cfg.get("auto_send"))
+        st.set_config(chat_id, cfg)
+        ch2 = st.get_chat(chat_id)
+        await q.edit_message_text(
+            f"Control Panel: {ch2['title']}",
+            reply_markup=kb_main(chat_id, bool(ch2["approved"]), ch2["config"] or default_config()),
+        )
+        return
+
+    if action == "toggle":
+        what = parts[2]
+        if what == "only":
+            cfg["only_if_changed"] = not bool(cfg.get("only_if_changed"))
+            st.set_config(chat_id, cfg)
+        ch2 = st.get_chat(chat_id)
+        await q.edit_message_text(
+            f"Control Panel: {ch2['title']}",
+            reply_markup=kb_main(chat_id, bool(ch2["approved"]), ch2["config"] or default_config()),
+        )
+        return
+
+    if action == "menu":
+        menu = parts[2]
+        if menu in ("cur", "coin", "metal"):
+            await q.edit_message_text(f"انتخاب {menu}:", reply_markup=kb_items(chat_id, menu, cfg))
+            return
+        if menu == "interval":
+            await q.edit_message_text("Interval:", reply_markup=kb_interval(chat_id, cfg))
+            return
+        if menu == "quiet":
+            await q.edit_message_text("Quiet hours:", reply_markup=kb_quiet(chat_id, cfg))
+            return
+        if menu == "sellbuy":
+            await q.edit_message_text("Sell/Buy:", reply_markup=kb_sellbuy(chat_id, cfg))
+            return
+        if menu == "threshold":
+            await q.edit_message_text("Threshold:", reply_markup=kb_threshold(chat_id, cfg))
+            return
+        if menu == "triggers":
+            await q.edit_message_text("تریگرها:", reply_markup=kb_triggers(chat_id, cfg))
             return
 
-    # snapshot
-    new_sent_vals: Dict[str, Any] = {}
-    for k, item in ITEMS.items():
-        v = BonbastClient.get_value_float(item, json_data, cfg.get("mode", "sell"))
-        if v is not None:
-            new_sent_vals[k] = v
+    if action == "trigcat":
+        cat = parts[2]
+        await q.edit_message_text(f"تریگر {cat}:", reply_markup=kb_trig_items(chat_id, cat, cfg))
+        return
 
-    send_mode = cfg.get("send_mode", "post")
-    if send_mode == "edit" and last_message_id:
-        try:
-            await app.bot.edit_message_text(chat_id=chat_id, message_id=int(last_message_id), text=msg, disable_web_page_preview=True)
-        except Exception:
-            sent = await app.bot.send_message(chat_id=chat_id, text=msg, disable_web_page_preview=True)
-            last_message_id = sent.message_id
-    else:
-        sent = await app.bot.send_message(chat_id=chat_id, text=msg, disable_web_page_preview=True)
-        last_message_id = sent.message_id
+    if action == "togitem":
+        cat = parts[2]
+        code = parts[3]
+        sel = cfg.setdefault("selected", {}).setdefault(cat, [])
+        if code in sel:
+            sel.remove(code)
+        else:
+            sel.append(code)  # order = selection order
+        st.set_config(chat_id, cfg)
+        await q.edit_message_reply_markup(reply_markup=kb_items(chat_id, cat, cfg))
+        return
 
-    state["last_sent_vals"] = new_sent_vals
-    state["last_message_id"] = last_message_id
-    state["first_post_done"] = True
-    st.save_state(chat_id, state)
+    if action == "resetorder":
+        cat = parts[2]
+        cfg.setdefault("selected", {})[cat] = []
+        st.set_config(chat_id, cfg)
+        await q.edit_message_reply_markup(reply_markup=kb_items(chat_id, cat, cfg))
+        return
+
+    if action == "all":
+        cat = parts[2]
+        on = parts[3] == "1"
+        cfg.setdefault("selected", {})[cat] = [i.code for i in CAT_BY_CAT[cat]] if on else []
+        st.set_config(chat_id, cfg)
+        await q.edit_message_reply_markup(reply_markup=kb_items(chat_id, cat, cfg))
+        return
+
+    if action == "togtrig":
+        cat = parts[2]
+        code = parts[3]
+        tr = cfg.setdefault("triggers", {}).setdefault(cat, [])
+        if code in tr:
+            tr.remove(code)
+        else:
+            tr.append(code)
+        st.set_config(chat_id, cfg)
+        await q.edit_message_reply_markup(reply_markup=kb_trig_items(chat_id, cat, cfg))
+        return
+
+    if action == "trigall":
+        cat = parts[2]
+        mode = parts[3]  # 1 => all selected ; 0 => empty = all selected implicitly
+        if mode == "1":
+            cfg.setdefault("triggers", {})[cat] = list(cfg.get("selected", {}).get(cat, []))
+        else:
+            cfg.setdefault("triggers", {})[cat] = []
+        st.set_config(chat_id, cfg)
+        await q.edit_message_reply_markup(reply_markup=kb_trig_items(chat_id, cat, cfg))
+        return
+
+    if action == "setint":
+        n = int(parts[2])
+        cfg["interval_min"] = n
+        st.set_config(chat_id, cfg)
+        await q.edit_message_text("Interval:", reply_markup=kb_interval(chat_id, cfg))
+        return
+
+    if action == "clearquiet":
+        cfg["quiet"] = ""
+        st.set_config(chat_id, cfg)
+        await q.edit_message_text("Quiet hours:", reply_markup=kb_quiet(chat_id, cfg))
+        return
+
+    if action == "setsb":
+        mode = parts[2]
+        cfg["sellbuy"] = "buy" if mode == "buy" else "sell"
+        st.set_config(chat_id, cfg)
+        await q.edit_message_text("Sell/Buy:", reply_markup=kb_sellbuy(chat_id, cfg))
+        return
+
+    if action == "setth":
+        n = int(parts[2])
+        cfg["threshold"] = n
+        st.set_config(chat_id, cfg)
+        await q.edit_message_text("Threshold:", reply_markup=kb_threshold(chat_id, cfg))
+        return
+
+    if action == "ask":
+        kind = parts[2]
+        # prompt user to type next message
+        if kind == "interval":
+            context.user_data["PENDING"] = {"chat_id": chat_id, "kind": "interval"}
+            await q.edit_message_text("یک عدد دقیقه بفرستید. مثال: 5")
+            return
+        if kind == "quiet":
+            context.user_data["PENDING"] = {"chat_id": chat_id, "kind": "quiet"}
+            await q.edit_message_text("فرمت: 23:00-08:00  (یا OFF برای خاموش)")
+            return
+        if kind == "threshold":
+            context.user_data["PENDING"] = {"chat_id": chat_id, "kind": "threshold"}
+            await q.edit_message_text("یک عدد (تومان) بفرستید. مثال: 1000  (یا 0 برای خاموش)")
+            return
+
+    if action == "export":
+        payload = json.dumps(cfg, ensure_ascii=False, indent=2)
+        await q.edit_message_text(f"<pre>{payload}</pre>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back", callback_data=f"panel|{chat_id}")],
+             [InlineKeyboardButton("Import config…", callback_data=f"import|{chat_id}")]]
+        ))
+        return
+
+    if action == "import":
+        context.user_data["PENDING"] = {"chat_id": chat_id, "kind": "import"}
+        await q.edit_message_text("JSON کانفیگ را همینجا Paste کنید:")
+        return
+
+    if action in ("test", "sendnow"):
+        await q.edit_message_text("در حال ارسال…")
+        await send_for_chat(context, chat_id, force=True, test=(action == "test"))
+        ch2 = st.get_chat(chat_id)
+        await q.message.reply_text(
+            f"Control Panel: {ch2['title']}",
+            reply_markup=kb_main(chat_id, bool(ch2["approved"]), ch2["config"] or default_config()),
+        )
+        return
+
+
+# ---------------- Sending loop ----------------
+
+async def send_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, force: bool, test: bool = False) -> None:
+    st: Storage = context.bot_data["STORAGE"]
+    client: BonbastClient = context.bot_data["CLIENT"]
+
+    ch = st.get_chat(chat_id)
+    if not ch:
+        return
+    approved = bool(ch["approved"])
+    cfg = ch["config"] or default_config()
+    state = ch["state"] or {}
+
+    if not force:
+        if not approved or not cfg.get("auto_send"):
+            return
+
+    now = datetime.now(TZ)
+    if not force and in_quiet(now, cfg.get("quiet", "")):
+        return
+
+    data = await client.fetch()
+
+    # date/time from bonbast json if present
+    try:
+        y = str(data.get("year", "")).strip()
+        mo = str(data.get("month", "")).strip()
+        d = str(data.get("day", "")).strip()
+        hh = str(data.get("hour", "")).strip()
+        mm = str(data.get("min", "")).strip()
+        if y and mo and d and hh and mm:
+            dt_header = f"{y}/{mo}/{d} - {hh}:{mm}"
+        else:
+            dt_header = now.strftime("%Y/%m/%d - %H:%M")
+    except Exception:
+        dt_header = now.strftime("%Y/%m/%d - %H:%M")
+
+    last_values = state.get("last_values", {})
+    if not isinstance(last_values, dict):
+        last_values = {}
+
+    # Build message
+    rtl = "\u200f"
+    header = f"{rtl}✅ نرخ لحظه‌ای ارز و سکه\n{rtl}📅 {dt_header}\n"
+
+    # For per-category comparisons
+    last_cur = {k: float(v) for k, v in last_values.get("cur", {}).items()} if isinstance(last_values.get("cur"), dict) else {}
+    last_coin = {k: float(v) for k, v in last_values.get("coin", {}).items()} if isinstance(last_values.get("coin"), dict) else {}
+    last_met = {k: float(v) for k, v in last_values.get("metal", {}).items()} if isinstance(last_values.get("metal"), dict) else {}
+
+    cur_lines, new_cur, cur_changed = build_lines(CURRENCIES, cfg, data, last_cur)
+    coin_lines, new_coin, coin_changed = build_lines(COINS, cfg, data, last_coin)
+    met_lines, new_met, met_changed = build_lines(METALS, cfg, data, last_met)
+
+    # Determine if we should send (only_if_changed)
+    should_send = True
+    if cfg.get("only_if_changed"):
+        should_send = cur_changed or coin_changed or met_changed
+
+    # Always refresh last values so comparisons stay correct
+    new_last_values = {
+        "cur": new_cur,
+        "coin": new_coin,
+        "metal": new_met,
+    }
+
+    # For scheduled sends: avoid duplicates within same minute slot
+    slot = now_slot_tehran(now)
+    if not force:
+        if state.get("last_slot") == slot:
+            return
+
+    state["last_values"] = new_last_values
+    state["last_slot"] = slot
+    st.set_state(chat_id, state)
+
+    if not should_send and not force:
+        return
+
+    parts: List[str] = [header]
+    if cur_lines:
+        parts.append("\n".join(cur_lines))
+    if coin_lines:
+        parts.append("_______________________\n" + "\n".join(coin_lines))
+    if met_lines:
+        parts.append("_______________________\n" + "\n".join(met_lines))
+
+    msg = "\n\n".join(parts).strip()
+
+    target = context.bot_data["ADMIN_IDS"][0] if test else chat_id
+    await context.bot.send_message(chat_id=target, text=msg)
 
 
 async def sender_loop(app: Application) -> None:
-    st: Storage = app.bot_data["storage"]
-    client: BonbastClient = app.bot_data["client"]
-    logger = logging.getLogger("bonbast-bot")
-
+    # Align to next minute boundary
     while True:
-        try:
-            chats = st.list_chats()
-            now = pytz.utc.localize(__import__("datetime").datetime.utcnow()).astimezone(TEHRAN_TZ)
-            now_hm = now.strftime("%H:%M")
+        now = datetime.now(TZ)
+        sleep_s = 60 - now.second - (now.microsecond / 1_000_000)
+        if sleep_s < 0.1:
+            sleep_s = 0.1
+        await asyncio.sleep(sleep_s)
 
-            due: List[int] = []
-            for rec in chats:
-                if not rec["approved"]:
-                    continue
-                cfg = rec["config"] or default_config()
-                if not cfg.get("auto_send"):
-                    continue
-                if in_quiet(now_hm, cfg.get("quiet", [])):
-                    continue
+        st: Storage = app.bot_data["STORAGE"]
+        chats = st.list_chats()
+        if not chats:
+            continue
 
+        now = datetime.now(TZ)
+        for ch in chats:
+            try:
+                cfg = ch["config"] or default_config()
+                if not ch["approved"] or not cfg.get("auto_send"):
+                    continue
                 interval = int(cfg.get("interval_min", 5) or 5)
                 if interval < 1:
-                    interval = 1
-
-                # aligned minutes (12:00, 12:05, ...)
+                    interval = 5
                 if now.minute % interval != 0:
                     continue
-                if now.second > 15:
+                if in_quiet(now, cfg.get("quiet", "")):
                     continue
-
-                slot = now.strftime("%Y%m%d%H%M")
-                state = rec["state"] or {}
-                if state.get("last_slot") == slot:
-                    continue
-                state["last_slot"] = slot
-                st.save_state(rec["chat_id"], state)
-                due.append(rec["chat_id"])
-
-            if due:
-                # one fetch for speed
-                json_data = await client.fetch_json()
-                app.bot_data["data_cache"].update(json_data, "sell")
-                for cid in due:
-                    await send_to_chat(app, cid, force=False)
-
-        except Exception as e:
-            logger.exception("sender_loop error: %s", e)
-
-        await asyncio.sleep(3)
+                await send_for_chat(app.bot_data["CTX"], ch["chat_id"], force=False)
+                await asyncio.sleep(0.2)
+            except Exception as e:
+                LOG.exception("sender_loop chat error: %s", e)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logging.getLogger("bonbast-bot").exception("Unhandled error", exc_info=context.error)
+    LOG.exception("Unhandled error", exc_info=context.error)
+
+
+# ---------------- Main ----------------
+
+def parse_admin_ids(s: str) -> List[int]:
+    out: List[int] = []
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(int(part))
+    return out
 
 
 def main() -> None:
     load_dotenv()
 
-    token = os.environ.get("BOT_TOKEN", "").strip()
+    token = os.getenv("BOT_TOKEN", "").strip()
+    admin_ids_raw = os.getenv("ADMIN_IDS", "").strip()
+    db_path = os.getenv("DB_PATH", "").strip() or "/root/bonbast-bot/app/data/bonbast.db"
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+
+    logging.basicConfig(level=getattr(logging, log_level, logging.INFO), format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
     if not token:
         raise SystemExit("BOT_TOKEN is missing in .env")
-
-    admin_ids = parse_admin_ids(os.environ.get("ADMIN_IDS", ""))
-    if not admin_ids:
+    if not admin_ids_raw:
         raise SystemExit("ADMIN_IDS is missing in .env (must contain your Telegram numeric user id)")
 
-    db_path = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "data.db"))
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    admin_ids = parse_admin_ids(admin_ids_raw)
 
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
-
-    storage = Storage(db_path)
+    st = Storage(db_path)
     client = BonbastClient()
-    cache = DataCache()
 
-    async def post_init(app: Application) -> None:
-        app.create_task(sender_loop(app))
+    app = Application.builder().token(token).build()
 
-    app = ApplicationBuilder().token(token).post_init(post_init).build()
-    app.bot_data["admin_ids"] = admin_ids
-    app.bot_data["storage"] = storage
-    app.bot_data["client"] = client
-    app.bot_data["data_cache"] = cache
+    # Store global objects
+    app.bot_data["ADMIN_IDS"] = admin_ids
+    app.bot_data["STORAGE"] = st
+    app.bot_data["CLIENT"] = client
+    # Hack: pass context into sender_loop helper
+    app.bot_data["CTX"] = type("X", (), {"bot_data": app.bot_data, "bot": app.bot})()
 
-    app.add_error_handler(on_error)
+    # Handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("register", cmd_register))
     app.add_handler(CommandHandler("panel", cmd_panel))
+    app.add_handler(CommandHandler("register", cmd_register))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_text))
+    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, on_text))
+    app.add_error_handler(on_error)
 
-    app.run_polling(close_loop=False)
+    async def post_init(_: Application) -> None:
+        app.create_task(sender_loop(app))
+
+    app.post_init = post_init
+
+    LOG.info("Starting bot…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)  # ensure we get my_chat_member updates
 
 
 if __name__ == "__main__":
