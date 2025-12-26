@@ -37,6 +37,8 @@ def parse_owner_ids(raw: str) -> List[int]:
 def is_owner(user_id: Optional[int], owners: List[int]) -> bool:
     return user_id is not None and user_id in owners
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled exception while handling an update:", exc_info=context.error)
 
 async def safe_dm(app: Application, user_id: int, text: str, reply_markup=None) -> None:
     try:
@@ -321,3 +323,4 @@ if __name__ == "__main__":
     app = build_app()
     # Ensure we receive member updates; using ALL_TYPES is a common fix when updates are missing. :contentReference[oaicite:7]{index=7}
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_error_handler(error_handler)
